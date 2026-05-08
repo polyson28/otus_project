@@ -1,0 +1,68 @@
+project_name: ts_project
+target_col: balance
+date_col: date
+prediction_horizon: 1
+
+s3:
+  endpoint_url: https://storage.yandexcloud.net
+  region_name: ru-central1
+  bucket: ts-project-bucket
+  raw_prefix: raw/
+  interim_prefix: interim/
+  features_prefix: features/
+  models_prefix: models/
+  predictions_prefix: predictions/
+  metrics_prefix: metrics/
+
+model:
+  production_prefix: models/production/
+  min_improvement: 0.0
+  validation_size: 0.2
+  metric: mae
+
+feature_engineering:
+  lags:
+    - 1
+    - 2
+    - 7
+  rolling_windows:
+    - 3
+    - 7
+    - 30
+  use_calendar_features: true
+  use_tax_features: true
+  use_macro_features: true
+
+feature_selection:
+  enabled: true
+  mode: "target_aware"
+  default_method: "default"
+  methods:
+    remove_constant: true
+    remove_high_missing: true
+    remove_high_correlation: true
+    remove_low_importance: true
+  missing_threshold: 0.4
+  correlation_threshold: 0.95
+  validation_size: 0.2
+  importance_model: "random_forest"
+  importance_threshold: 0.01
+  max_features: null
+  random_state: 42
+  wrapper:
+    min_features_to_select: 5
+    step: 1
+    scoring: "neg_mean_squared_error"
+  filter:
+    threshold: 0.01
+    delay: 1
+    embed_dim: 3
+  always_keep:
+    - date
+  target_aware_metrics:
+    use_mutual_info: true
+    use_correlation_with_target: true
+
+service:
+  model_reload_seconds: 300
+  log_level: INFO
