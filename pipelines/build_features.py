@@ -118,6 +118,10 @@ def main() -> None:
             LOGGER.info("Building features in train mode with fit_transform.")
             pipeline = build_pipeline_from_config(config)
             features = pipeline.fit_transform(df, macro_df=macro_df, tax_dates=tax_dates)
+            aligned_source = df.loc[features.index, [config["date_col"], config["target_col"]]].reset_index(drop=True)
+            features = features.reset_index(drop=True)
+            features[config["date_col"]] = aligned_source[config["date_col"]].values
+            features[config["target_col"]] = aligned_source[config["target_col"]].values
         else:
             LOGGER.info("Building features in inference mode with saved pipeline.")
             pipeline = TimeSeriesFeaturePipeline.load(args.feature_pipeline_uri)
