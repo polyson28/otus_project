@@ -1,0 +1,9 @@
+.git
+notebooks
+artifacts
+__pycache__
+**/__pycache__
+.env
+*.pkl
+*.parquet
+.pytest_cache

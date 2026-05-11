@@ -1,0 +1,230 @@
+services:
+  mlflow-postgres:
+    image: postgres:15
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-mlflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mlflow}
+      POSTGRES_DB: ${POSTGRES_DB:-mlflow}
+    ports:
+      - "5432:5432"
+    volumes:
+      - mlflow-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  mlflow:
+    build:
+      context: .
+      dockerfile: Dockerfile.pipeline
+    image: ts-project-pipeline:local
+    env_file:
+      - .env
+    environment:
+      MLFLOW_SERVER_ALLOWED_HOSTS: "*"
+      MLFLOW_SERVER_CORS_ALLOWED_ORIGINS: "*"
+    depends_on:
+      mlflow-postgres:
+        condition: service_healthy
+    command:
+      - sh
+      - -c
+      - >
+        mlflow server
+        --backend-store-uri postgresql://$$POSTGRES_USER:$$POSTGRES_PASSWORD@mlflow-postgres:5432/$$POSTGRES_DB
+        --default-artifact-root "$$MLFLOW_DEFAULT_ARTIFACT_ROOT"
+        --host 0.0.0.0
+        --port 5001
+    ports:
+      - "5001:5001"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:5001').read()"
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    image: ts-project-api:local
+    env_file:
+      - .env
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5001
+      MODEL_SOURCE: mlflow
+      REGISTERED_MODEL_NAME: ${REGISTERED_MODEL_NAME:-ts-project-forecast-model}
+      MODEL_ALIAS: ${MODEL_ALIAS:-latest}
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./artifacts:/app/artifacts
+
+  airflow-postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    ports:
+      - "5433:5432"
+    volumes:
+      - airflow-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U airflow -d airflow
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  airflow-init:
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    image: ts-project-airflow:local
+    env_file:
+      - .env
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "True"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres:5432/airflow
+      AIRFLOW__CORE__FERNET_KEY: ""
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "True"
+      AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+      MLFLOW_TRACKING_URI: http://mlflow:5001
+      API_RELOAD_URL: http://api:8000/reload_model
+      PYTHONPATH: /opt/airflow/project
+      _AIRFLOW_WWW_USER_USERNAME: airflow
+      _AIRFLOW_WWW_USER_PASSWORD: airflow
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs/airflow:/opt/airflow/logs
+      - ./plugins:/opt/airflow/plugins
+      - ./pipelines:/opt/airflow/project/pipelines
+      - ./src:/opt/airflow/project/src
+      - ./TS_model:/opt/airflow/project/TS_model
+      - ./DS_research:/opt/airflow/project/DS_research
+      - ./configs:/opt/airflow/project/configs
+      - ./Data:/opt/airflow/project/Data
+      - ./artifacts:/opt/airflow/project/artifacts
+    command:
+      - bash
+      - -c
+      - >
+        airflow db migrate &&
+        (airflow users create
+        --username "$${_AIRFLOW_WWW_USER_USERNAME}"
+        --password "$${_AIRFLOW_WWW_USER_PASSWORD}"
+        --firstname Airflow
+        --lastname Admin
+        --role Admin
+        --email admin@example.com || true)
+
+  airflow-webserver:
+    image: ts-project-airflow:local
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    env_file:
+      - .env
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "True"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres:5432/airflow
+      AIRFLOW__CORE__FERNET_KEY: ""
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "True"
+      AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+      MLFLOW_TRACKING_URI: http://mlflow:5001
+      API_RELOAD_URL: http://api:8000/reload_model
+      PYTHONPATH: /opt/airflow/project
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs/airflow:/opt/airflow/logs
+      - ./plugins:/opt/airflow/plugins
+      - ./pipelines:/opt/airflow/project/pipelines
+      - ./src:/opt/airflow/project/src
+      - ./TS_model:/opt/airflow/project/TS_model
+      - ./DS_research:/opt/airflow/project/DS_research
+      - ./configs:/opt/airflow/project/configs
+      - ./Data:/opt/airflow/project/Data
+      - ./artifacts:/opt/airflow/project/artifacts
+    command: webserver
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8080/health').read()"
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  airflow-scheduler:
+    image: ts-project-airflow:local
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    env_file:
+      - .env
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "True"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres:5432/airflow
+      AIRFLOW__CORE__FERNET_KEY: ""
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "True"
+      AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+      MLFLOW_TRACKING_URI: http://mlflow:5001
+      API_RELOAD_URL: http://api:8000/reload_model
+      PYTHONPATH: /opt/airflow/project
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs/airflow:/opt/airflow/logs
+      - ./plugins:/opt/airflow/plugins
+      - ./pipelines:/opt/airflow/project/pipelines
+      - ./src:/opt/airflow/project/src
+      - ./TS_model:/opt/airflow/project/TS_model
+      - ./DS_research:/opt/airflow/project/DS_research
+      - ./configs:/opt/airflow/project/configs
+      - ./Data:/opt/airflow/project/Data
+      - ./artifacts:/opt/airflow/project/artifacts
+    command: scheduler
+
+volumes:
+  mlflow-postgres-data:
+  airflow-postgres-data:
