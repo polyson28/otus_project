@@ -6,13 +6,21 @@ prediction_horizon: 1
 s3:
   endpoint_url: https://storage.yandexcloud.net
   region_name: ru-central1
-  bucket: ts-project-bucket
+  bucket: ${YANDEX_S3_BUCKET}
   raw_prefix: raw/
   interim_prefix: interim/
   features_prefix: features/
   models_prefix: models/
   predictions_prefix: predictions/
+  monitoring_prefix: monitoring/
   metrics_prefix: metrics/
+  uris:
+    raw_data: s3://${YANDEX_S3_BUCKET}/raw/
+    interim_data: s3://${YANDEX_S3_BUCKET}/interim/
+    features: s3://${YANDEX_S3_BUCKET}/features/
+    prediction_logs: s3://${YANDEX_S3_BUCKET}/predictions/
+    monitoring_reports: s3://${YANDEX_S3_BUCKET}/monitoring/
+    mlflow_artifacts: s3://${YANDEX_S3_BUCKET}/mlflow-artifacts/
 
 model:
   production_prefix: models/production/
@@ -26,7 +34,7 @@ mlflow:
   experiment_name: ts-project
   registered_model_name: ts-project-forecast-model
   model_alias: champion
-  artifact_root: s3://ts-project-bucket/mlflow-artifacts
+  artifact_root: s3://${YANDEX_S3_BUCKET}/mlflow-artifacts
   log_input_examples: true
   log_model_signature: true
   challenger_alias: challenger
@@ -49,11 +57,37 @@ promotion:
   min_mae_improvement: 0.0
   require_profit_not_worse: true
 
+monitoring:
+  min_rows_for_check: 30
+  psi_threshold_warning: 0.1
+  psi_threshold_critical: 0.25
+  mae_degradation_ratio: 1.2
+  anomaly_retrain_min_consecutive_days: 2
+
 dvc:
   enabled: true
   remote_name: yc-storage
-  remote_url: s3://ts-project-bucket/dvc-store
+  remote_url: s3://${YANDEX_S3_BUCKET}/dvc-store
   endpoint_url: https://storage.yandexcloud.net
+
+yandex_cloud:
+  folder_id: ${YC_FOLDER_ID}
+  registry_id: ${YC_CONTAINER_REGISTRY_ID}
+  container_registry:
+    api_image: cr.yandex/${YC_CONTAINER_REGISTRY_ID}/ts-project-api:${IMAGE_TAG}
+    airflow_image: cr.yandex/${YC_CONTAINER_REGISTRY_ID}/ts-project-airflow:${IMAGE_TAG}
+    pipeline_image: cr.yandex/${YC_CONTAINER_REGISTRY_ID}/ts-project-pipeline:${IMAGE_TAG}
+  object_storage:
+    bucket: ${YANDEX_S3_BUCKET}
+    raw_data_uri: s3://${YANDEX_S3_BUCKET}/raw/
+    interim_data_uri: s3://${YANDEX_S3_BUCKET}/interim/
+    features_uri: s3://${YANDEX_S3_BUCKET}/features/
+    prediction_logs_uri: s3://${YANDEX_S3_BUCKET}/predictions/
+    monitoring_reports_uri: s3://${YANDEX_S3_BUCKET}/monitoring/
+    mlflow_artifacts_uri: s3://${YANDEX_S3_BUCKET}/mlflow-artifacts/
+  airflow:
+    recommended_service: yandex_managed_airflow
+    dags_storage_uri: s3://${YANDEX_S3_BUCKET}/airflow/dags/
 
 feature_engineering:
   lags:

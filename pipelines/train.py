@@ -3,15 +3,15 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import pandas as pd
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -20,30 +20,37 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.config import load_config
 from src.io.s3 import (
-    S3Error,
     download_file,
     is_s3_uri,
     joblib_load_from_uri,
+    S3ObjectNotFoundError,
+    latest_object_uri,
+    read_csv,
+    read_excel,
     read_json,
     read_parquet,
+    write_json,
 )
-from src.models.mlflow_utils import (
-    find_model_version_by_run_id,
-    get_current_alias_version,
-    get_model_alias,
+from src.models.evaluate import backtest_time_windows, date_range_payload, prefixed_metrics
+from src.models.mlflow_registry import (
+    get_current_production_version,
     get_model_version_metric,
-    get_registered_model_name,
-    infer_and_log_model,
-    log_config_params,
-    log_dataset_info,
-    set_model_alias,
-    setup_mlflow,
-    should_promote_model,
+    log_model_candidate,
+    promote_to_production,
+    should_promote,
 )
-from src.models.training import fit_model
+from src.models.train import (
+    evaluate_split,
+    feature_importance_frame,
+    prepare_supervised_dataset,
+    split_train_valid_test,
+    train_model,
+)
+from src.models.mlflow_utils import setup_mlflow
 
 
 LOGGER = logging.getLogger("train")
+DEFAULT_REPORTS_DIR = "artifacts/training"
 
 
 def parse_bool(value: str | bool) -> bool:
@@ -58,31 +65,154 @@ def parse_bool(value: str | bool) -> bool:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a time series model and register it in MLflow.")
-    parser.add_argument("--features-uri", required=True, help="Input features parquet URI/path.")
+    parser = argparse.ArgumentParser(description="Train and register a time series model in MLflow.")
+    parser.add_argument("--features-uri", required=True, help="Input features dataset URI/path.")
     parser.add_argument("--feature-pipeline-uri", required=True, help="Feature pipeline joblib URI/path.")
+    parser.add_argument("--experiment-name", required=True, help="MLflow experiment name.")
+    parser.add_argument("--registered-model-name", required=True, help="MLflow registered model name.")
     parser.add_argument("--config", default="configs/config.yaml", help="Path to YAML config.")
-    parser.add_argument("--promote-if-better", type=parse_bool, default=True, help="Promote model when metric improves.")
     parser.add_argument("--run-name", default=None, help="Optional MLflow run name.")
+    parser.add_argument("--promote-if-better", type=parse_bool, default=True, help="Promote when validation MAE improves.")
     return parser.parse_args()
 
 
+def read_features(uri: str) -> pd.DataFrame:
+    lower_uri = uri.lower()
+    if lower_uri.endswith(".parquet"):
+        return read_parquet(uri)
+    if lower_uri.endswith(".csv"):
+        return read_csv(uri)
+    if lower_uri.endswith((".xlsx", ".xls")):
+        return read_excel(uri)
+    raise ValueError(f"Unsupported features dataset format: {uri}")
+
+
 def companion_uri(uri: str, filename: str) -> str:
-    if "/" not in uri:
-        return filename
-    return uri.rsplit("/", 1)[0] + "/" + filename
+    return uri.rsplit("/", 1)[0] + "/" + filename if "/" in uri else filename
 
 
 def read_optional_json(uri: str) -> dict[str, Any] | None:
     try:
         payload = read_json(uri)
-    except (FileNotFoundError, S3Error, json.JSONDecodeError) as error:
-        LOGGER.info("Optional JSON artifact is unavailable at %s: %s", uri, error)
+    except Exception as error:
+        LOGGER.info("Optional JSON is unavailable at %s: %s", uri, error)
         return None
-    if not isinstance(payload, dict):
-        LOGGER.warning("Optional JSON artifact at %s is not an object; skipping.", uri)
+    return payload if isinstance(payload, dict) else None
+
+
+def load_feature_schema(feature_pipeline_uri: str, config: dict[str, Any]) -> dict[str, Any] | None:
+    schema_uri = os.getenv("FEATURE_SCHEMA_URI") or companion_uri(feature_pipeline_uri, "feature_schema.json")
+    schema = read_optional_json(schema_uri)
+    if schema is not None:
+        return schema
+
+    prefix = s3_features_prefix(config)
+    if not prefix:
         return None
-    return payload
+    try:
+        latest_schema_uri = latest_object_uri(
+            f"{prefix.rstrip('/')}/train",
+            suffixes=(".json",),
+            preferred_filename="feature_schema.json",
+        )
+    except Exception as error:
+        LOGGER.info("Could not find latest feature schema in S3: %s", error)
+        return None
+    return read_optional_json(latest_schema_uri)
+
+
+def s3_features_prefix(config: dict[str, Any]) -> str | None:
+    env_uri = os.getenv("FEATURES_S3_PREFIX") or os.getenv("FEATURES_PREFIX_URI")
+    if env_uri:
+        return env_uri
+    s3_config = config.get("s3", {})
+    bucket = os.getenv("YANDEX_S3_BUCKET") or s3_config.get("bucket")
+    prefix = str(s3_config.get("features_prefix", "features/")).strip("/")
+    if not bucket:
+        return None
+    return f"s3://{bucket}/{prefix}"
+
+
+def resolve_input_uri(
+    uri: str,
+    *,
+    config: dict[str, Any],
+    env_name: str,
+    suffixes: tuple[str, ...],
+) -> str:
+    env_uri = os.getenv(env_name)
+    if env_uri:
+        LOGGER.info("Using %s from environment: %s", env_name, env_uri)
+        return env_uri
+    if is_s3_uri(uri) or Path(uri).exists():
+        return uri
+
+    prefix = s3_features_prefix(config)
+    if not prefix:
+        return uri
+
+    preferred_prefixes = [
+        f"{prefix.rstrip('/')}/train",
+        prefix,
+    ]
+    errors: list[str] = []
+    for candidate_prefix in preferred_prefixes:
+        try:
+            latest_uri = latest_object_uri(
+                candidate_prefix,
+                suffixes=suffixes,
+                preferred_filename=Path(uri).name,
+            )
+            break
+        except S3ObjectNotFoundError as error:
+            errors.append(str(error))
+    else:
+        raise S3ObjectNotFoundError("Could not find training input in S3. " + " | ".join(errors))
+
+    LOGGER.warning("Local input %s not found. Using latest S3 artifact: %s", uri, latest_uri)
+    return latest_uri
+
+
+def ensure_supervised_features(
+    features_df: pd.DataFrame,
+    *,
+    feature_pipeline: Any,
+    feature_pipeline_uri: str,
+    config: dict[str, Any],
+    target_col: str,
+    date_col: str,
+) -> pd.DataFrame:
+    if target_col in features_df.columns:
+        return features_df
+
+    schema = load_feature_schema(feature_pipeline_uri, config)
+    source_data_uri = schema.get("source_data_uri") if schema else None
+    if not source_data_uri:
+        raise ValueError(
+            f"Missing target column: {target_col}. Feature schema has no source_data_uri to rebuild supervised data."
+        )
+
+    LOGGER.warning(
+        "Features do not contain target column %s. Rebuilding supervised training frame from %s.",
+        target_col,
+        source_data_uri,
+    )
+    source_df = read_features(str(source_data_uri))
+    if target_col not in source_df.columns:
+        raise ValueError(f"Source data {source_data_uri} does not contain target column: {target_col}")
+    if date_col not in source_df.columns:
+        raise ValueError(f"Source data {source_data_uri} does not contain date column: {date_col}")
+
+    rebuilt = feature_pipeline.transform(source_df)
+    aligned_source = source_df.loc[rebuilt.index, [date_col, target_col]].reset_index(drop=True)
+    rebuilt = rebuilt.reset_index(drop=True)
+    rebuilt[date_col] = aligned_source[date_col].values
+    rebuilt[target_col] = aligned_source[target_col].values
+    feature_columns = getattr(feature_pipeline, "feature_columns", [])
+    if feature_columns:
+        rebuilt = rebuilt.dropna(subset=list(feature_columns))
+    rebuilt = rebuilt.dropna(subset=[target_col]).reset_index(drop=True)
+    return rebuilt
 
 
 def materialize_uri(uri: str, local_path: Path) -> Path:
@@ -93,248 +223,356 @@ def materialize_uri(uri: str, local_path: Path) -> Path:
     return local_path
 
 
-def prepare_supervised_data(
-    df: pd.DataFrame,
-    target_col: str,
-    date_col: str,
-) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, list[str]]:
-    if target_col not in df.columns:
-        raise ValueError(f"Missing target column: {target_col}")
+def git_commit() -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception as error:
+        LOGGER.info("Git commit is unavailable: %s", error)
+        return None
+    commit = result.stdout.strip()
+    return commit or None
 
-    prepared = df.copy()
-    if date_col in prepared.columns:
-        prepared[date_col] = pd.to_datetime(prepared[date_col], errors="coerce")
-        invalid_dates = int(prepared[date_col].isna().sum())
-        if invalid_dates:
-            raise ValueError(f"Date column '{date_col}' contains {invalid_dates} invalid values.")
-        prepared = prepared.sort_values(date_col).reset_index(drop=True)
 
-    prepared = prepared.dropna(subset=[target_col]).reset_index(drop=True)
-    feature_columns = [
-        col for col in prepared.select_dtypes(include=[np.number]).columns
-        if col != target_col
-    ]
-    if not feature_columns:
-        raise ValueError("No numeric feature columns found for model training.")
+def set_experiment(experiment_name: str, config: dict[str, Any]) -> None:
+    import mlflow
 
-    return (
-        prepared[feature_columns].copy(),
-        prepared[target_col].astype(float).copy(),
-        prepared.copy(),
-        feature_columns,
+    setup_mlflow(config)
+    if mlflow.get_experiment_by_name(experiment_name) is None:
+        artifact_root = (
+            os.getenv("MLFLOW_DEFAULT_ARTIFACT_ROOT")
+            or os.getenv("MLFLOW_ARTIFACT_ROOT")
+            or config.get("mlflow", {}).get("artifact_root")
+        )
+        mlflow.create_experiment(name=experiment_name, artifact_location=artifact_root)
+    mlflow.set_experiment(experiment_name)
+
+
+def log_params_tags(
+    *,
+    config: dict[str, Any],
+    args: argparse.Namespace,
+    estimator_name: str,
+    feature_columns: list[str],
+    split,
+    feature_pipeline: Any,
+) -> None:
+    import mlflow
+
+    training_config = config.get("training", {})
+    model_config = config.get("model", {})
+    commit = git_commit()
+    params = {
+        "target_col": config.get("target_col"),
+        "date_col": config.get("date_col"),
+        "prediction_horizon": config.get("prediction_horizon"),
+        "model_kind": training_config.get("model_kind"),
+        "fallback_model": training_config.get("fallback_model"),
+        "time_budget": training_config.get("time_budget"),
+        "metric": model_config.get("metric", "mae"),
+        "validation_size": model_config.get("validation_size", 0.2),
+        "feature_count": len(feature_columns),
+        "train_rows": len(split.X_train),
+        "validation_rows": len(split.X_valid),
+        "test_rows": len(split.X_test),
+        "estimator_name": estimator_name,
+        "feature_pipeline_type": type(feature_pipeline).__name__,
+    }
+    mlflow.log_params({key: str(value) for key, value in params.items() if value is not None})
+    mlflow.set_tags(
+        {
+            "model_type": estimator_name,
+            "dataset_uri": getattr(args, "resolved_features_uri", args.features_uri),
+            "feature_pipeline_uri": getattr(args, "resolved_feature_pipeline_uri", args.feature_pipeline_uri),
+            "created_by": "train_pipeline",
+            **({"git_commit": commit} if commit else {}),
+        }
     )
 
 
-def time_series_split(
+def predictions_output_frame(
     X: pd.DataFrame,
     y: pd.Series,
-    prepared_df: pd.DataFrame,
-    validation_size: float,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, pd.DataFrame]:
-    if not 0 < validation_size < 1:
-        raise ValueError("validation_size must be between 0 and 1.")
-    if len(X) < 2:
-        raise ValueError("Need at least 2 rows for train/validation split.")
-
-    split_idx = max(1, int(len(X) * (1 - validation_size)))
-    if split_idx >= len(X):
-        split_idx = len(X) - 1
-    return (
-        X.iloc[:split_idx],
-        X.iloc[split_idx:],
-        y.iloc[:split_idx],
-        y.iloc[split_idx:],
-        prepared_df.iloc[split_idx:].copy(),
-    )
+    dates: pd.Series | None,
+    predictions,
+    *,
+    target_col: str,
+    date_col: str,
+) -> pd.DataFrame:
+    output = X.copy()
+    if dates is not None:
+        output[date_col] = dates.values
+    output[target_col] = y.values
+    output["prediction"] = predictions
+    return output
 
 
-def train_model(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    config: dict[str, Any],
-) -> tuple[Any, str]:
-    training_config = config.get("training", {})
-    return fit_model(
-        X_train=X_train,
-        y_train=y_train,
-        model_kind=str(training_config.get("model_kind", "flaml")),
-        fallback_model=str(training_config.get("fallback_model", "random_forest")),
-        time_budget=int(training_config.get("time_budget", 600)),
-        metric=str(training_config.get("metric", config.get("model", {}).get("metric", "mae"))),
-        prediction_horizon=int(config.get("prediction_horizon", 1)),
-        random_state=int(training_config.get("random_state", 42)),
-    )
-
-
-def calculate_metrics(y_true: pd.Series, y_pred: np.ndarray) -> dict[str, float]:
-    metrics = {
-        "mae": float(mean_absolute_error(y_true, y_pred)),
-        "rmse": float(np.sqrt(mean_squared_error(y_true, y_pred))),
-    }
-    non_zero_mask = np.asarray(y_true) != 0
-    if non_zero_mask.any():
-        y_true_array = np.asarray(y_true, dtype=float)
-        y_pred_array = np.asarray(y_pred, dtype=float)
-        metrics["mape"] = float(
-            np.mean(np.abs((y_true_array[non_zero_mask] - y_pred_array[non_zero_mask]) / y_true_array[non_zero_mask]))
-        )
-    if len(y_true) >= 2:
-        metrics["r2"] = float(r2_score(y_true, y_pred))
-    return metrics
-
-
-def feature_importance_frame(model: Any, feature_columns: list[str]) -> pd.DataFrame | None:
-    estimator = model
-    if hasattr(model, "named_steps"):
-        estimator = model.named_steps.get("model", model)
-    importances = getattr(estimator, "feature_importances_", None)
-    if importances is None:
-        return None
-    return pd.DataFrame(
-        {
-            "feature": feature_columns,
-            "importance": np.asarray(importances, dtype=float),
-        }
-    ).sort_values("importance", ascending=False)
+def write_dataframe_artifact(df: pd.DataFrame, parquet_path: Path, csv_path: Path) -> Path:
+    try:
+        df.to_parquet(parquet_path, index=False)
+        return parquet_path
+    except Exception as error:
+        LOGGER.warning("Could not write parquet artifact %s, falling back to CSV: %s", parquet_path, error)
+        df.to_csv(csv_path, index=False)
+        return csv_path
 
 
 def main() -> None:
     args = parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     import mlflow
 
     config = load_config(args.config)
-    setup_mlflow(config)
+    set_experiment(args.experiment_name, config)
 
-    target_col = config["target_col"]
-    date_col = config["date_col"]
-    validation_size = float(config.get("model", {}).get("validation_size", 0.2))
-    metric_name = str(config.get("model", {}).get("metric", "mae"))
-    min_improvement = float(config.get("model", {}).get("min_improvement", 0.0))
-    registered_model_name = get_registered_model_name(config)
-    champion_alias = get_model_alias(config)
+    target_col = str(config["target_col"])
+    date_col = str(config["date_col"])
+    model_config = config.get("model", {})
+    validation_size = float(model_config.get("validation_size", 0.2))
+    test_size = float(model_config.get("test_size", validation_size))
+    metric_name = str(model_config.get("metric", "mae"))
+    min_improvement = float(model_config.get("min_improvement", 0.0))
+    production_alias = str(config.get("mlflow", {}).get("production_alias", "Production"))
 
-    features_df = read_parquet(args.features_uri)
-    feature_pipeline = joblib_load_from_uri(args.feature_pipeline_uri)
-    feature_schema_uri = companion_uri(args.feature_pipeline_uri, "feature_schema.json")
-    feature_schema = read_optional_json(feature_schema_uri)
+    features_uri = resolve_input_uri(
+        args.features_uri,
+        config=config,
+        env_name="FEATURES_URI",
+        suffixes=(".parquet", ".csv"),
+    )
+    feature_pipeline_uri = resolve_input_uri(
+        args.feature_pipeline_uri,
+        config=config,
+        env_name="FEATURE_PIPELINE_URI",
+        suffixes=(".pkl", ".joblib"),
+    )
+    args.resolved_features_uri = features_uri
+    args.resolved_feature_pipeline_uri = feature_pipeline_uri
 
-    X, y, prepared_df, feature_columns = prepare_supervised_data(
+    features_df = read_features(features_uri)
+    feature_pipeline = joblib_load_from_uri(feature_pipeline_uri)
+    features_df = ensure_supervised_features(
         features_df,
+        feature_pipeline=feature_pipeline,
+        feature_pipeline_uri=feature_pipeline_uri,
+        config=config,
         target_col=target_col,
         date_col=date_col,
     )
-    X_train, X_val, y_train, y_val, validation_frame = time_series_split(
-        X=X,
-        y=y,
-        prepared_df=prepared_df,
-        validation_size=validation_size,
-    )
-    model, estimator_name = train_model(X_train, y_train, config)
-    validation_predictions = model.predict(X_val)
-    metrics = calculate_metrics(y_val, validation_predictions)
+    dataset = prepare_supervised_dataset(features_df, target_col=target_col, date_col=date_col)
+    split = split_train_valid_test(dataset, validation_size=validation_size, test_size=test_size)
+    model, estimator_name = train_model(split.X_train, split.y_train, config)
 
-    promoted_to_champion = False
-    new_model_version: str | None = None
+    train_metrics = evaluate_split(model, split.X_train, split.y_train)
+    validation_predictions = model.predict(split.X_valid)
+    validation_metrics = evaluate_split(model, split.X_valid, split.y_valid)
+    test_predictions = model.predict(split.X_test)
+    test_metrics = evaluate_split(model, split.X_test, split.y_test)
+    backtest = backtest_time_windows(
+        model,
+        pd.concat([split.X_valid, split.X_test], ignore_index=True),
+        pd.concat([split.y_valid, split.y_test], ignore_index=True),
+        pd.concat([split.valid_dates, split.test_dates], ignore_index=True)
+        if split.valid_dates is not None and split.test_dates is not None
+        else None,
+        n_windows=int(config.get("evaluation", {}).get("backtest_windows", 3)),
+        min_window_size=int(config.get("evaluation", {}).get("backtest_min_window_size", 10)),
+    )
+
+    metrics_to_log = {
+        **prefixed_metrics(train_metrics, "train"),
+        **prefixed_metrics(validation_metrics, "validation"),
+        **prefixed_metrics(test_metrics, "test"),
+        metric_name: float(validation_metrics[metric_name]),
+    }
+
+    promoted_to_production = False
+    promotion_reason = "promotion_disabled" if not args.promote_if_better else "not_evaluated"
+    production_version = None
+    production_metric = None
+    registry_result = None
+    run_id = None
+    experiment_id = None
 
     with tempfile.TemporaryDirectory() as tmp_dir_name:
         tmp_dir = Path(tmp_dir_name)
-        local_feature_pipeline = materialize_uri(args.feature_pipeline_uri, tmp_dir / "feature_pipeline.pkl")
-        local_feature_schema = tmp_dir / "feature_schema.json"
-        if feature_schema is not None:
-            local_feature_schema.write_text(json.dumps(feature_schema, ensure_ascii=False, indent=2), encoding="utf-8")
+        local_feature_pipeline = materialize_uri(feature_pipeline_uri, tmp_dir / "feature_pipeline.pkl")
+        local_config = materialize_uri(args.config, tmp_dir / "config.yaml")
 
-        local_metrics = tmp_dir / "metrics.json"
-        local_metrics.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
-
-        model_metadata = {
-            "registered_model_name": registered_model_name,
-            "estimator_name": estimator_name,
-            "target_col": target_col,
-            "date_col": date_col,
-            "feature_columns": feature_columns,
-            "features_uri": args.features_uri,
-            "feature_pipeline_uri": args.feature_pipeline_uri,
-            "feature_schema_uri": feature_schema_uri if feature_schema is not None else None,
-            "validation_size": validation_size,
-        }
         local_metadata = tmp_dir / "model_metadata.json"
-        local_metadata.write_text(json.dumps(model_metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+        local_metadata.write_text(
+            json.dumps(
+                {
+                    "registered_model_name": args.registered_model_name,
+                    "estimator_name": estimator_name,
+                    "target_col": target_col,
+                    "date_col": date_col,
+                    "feature_columns": dataset.feature_columns,
+                    "features_uri": features_uri,
+                    "feature_pipeline_uri": feature_pipeline_uri,
+                    "validation_size": validation_size,
+                    "test_size": test_size,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
 
-        validation_output = X_val.copy()
-        if date_col in validation_frame.columns:
-            validation_output[date_col] = validation_frame[date_col].values
-        validation_output[target_col] = y_val.values
-        validation_output["prediction"] = validation_predictions
-        local_predictions = tmp_dir / "validation_predictions.parquet"
-        try:
-            validation_output.to_parquet(local_predictions, index=False)
-        except Exception as error:
-            LOGGER.warning("Could not write parquet predictions, falling back to CSV: %s", error)
-            local_predictions = tmp_dir / "validation_predictions.csv"
-            validation_output.to_csv(local_predictions, index=False)
+        local_validation_predictions = write_dataframe_artifact(
+            predictions_output_frame(
+                split.X_valid,
+                split.y_valid,
+                split.valid_dates,
+                validation_predictions,
+                target_col=target_col,
+                date_col=date_col,
+            ),
+            tmp_dir / "validation_predictions.parquet",
+            tmp_dir / "validation_predictions.csv",
+        )
+        local_test_predictions = write_dataframe_artifact(
+            predictions_output_frame(
+                split.X_test,
+                split.y_test,
+                split.test_dates,
+                test_predictions,
+                target_col=target_col,
+                date_col=date_col,
+            ),
+            tmp_dir / "test_predictions.parquet",
+            tmp_dir / "test_predictions.csv",
+        )
+
+        local_backtest = tmp_dir / "backtest.json"
+        local_backtest.write_text(json.dumps(backtest, ensure_ascii=False, indent=2), encoding="utf-8")
 
         local_importance = tmp_dir / "feature_importance.csv"
-        importances = feature_importance_frame(model, feature_columns)
+        importances = feature_importance_frame(model, dataset.feature_columns)
         if importances is not None:
             importances.to_csv(local_importance, index=False)
 
         with mlflow.start_run(run_name=args.run_name) as run:
             run_id = run.info.run_id
             experiment_id = run.info.experiment_id
-
-            log_config_params(config)
-            log_dataset_info(features_df, args.features_uri, prefix="train")
-            mlflow.log_params(
-                {
-                    "estimator_name": estimator_name,
-                    "feature_count": len(feature_columns),
-                    "train_rows": len(X_train),
-                    "validation_rows": len(X_val),
-                    "feature_pipeline_type": type(feature_pipeline).__name__,
-                }
+            log_params_tags(
+                config=config,
+                args=args,
+                estimator_name=estimator_name,
+                feature_columns=dataset.feature_columns,
+                split=split,
+                feature_pipeline=feature_pipeline,
             )
-            mlflow.log_metrics(metrics)
+            mlflow.log_metrics(metrics_to_log)
+            mlflow.log_dict(
+                {
+                    "train": date_range_payload(split.train_dates),
+                    "validation": date_range_payload(split.valid_dates),
+                    "test": date_range_payload(split.test_dates),
+                },
+                "artifacts/date_ranges.json",
+            )
+            mlflow.log_dict({"feature_columns": dataset.feature_columns}, "artifacts/feature_columns.json")
             mlflow.log_artifact(str(local_feature_pipeline), artifact_path="artifacts")
-            if feature_schema is not None:
-                mlflow.log_artifact(str(local_feature_schema), artifact_path="artifacts")
-            mlflow.log_artifact(str(local_metrics), artifact_path="artifacts")
+            mlflow.log_artifact(str(local_config), artifact_path="artifacts")
             mlflow.log_artifact(str(local_metadata), artifact_path="artifacts")
-            mlflow.log_artifact(str(local_predictions), artifact_path="artifacts")
+            mlflow.log_artifact(str(local_validation_predictions), artifact_path="artifacts")
+            mlflow.log_artifact(str(local_test_predictions), artifact_path="artifacts")
+            mlflow.log_artifact(str(local_backtest), artifact_path="artifacts")
             if importances is not None:
                 mlflow.log_artifact(str(local_importance), artifact_path="artifacts")
 
-            infer_and_log_model(
+            registry_result = log_model_candidate(
                 model=model,
-                X_train=X_train,
-                registered_model_name=registered_model_name,
+                X_train=split.X_train,
+                registered_model_name=args.registered_model_name,
                 artifact_path="model",
-                input_example=X_train.head(5),
+                input_example=split.X_train.head(5),
             )
-            new_model_version = find_model_version_by_run_id(registered_model_name, run_id)
 
-            if args.promote_if_better:
-                current_version = get_current_alias_version(registered_model_name, champion_alias)
-                old_metric = (
-                    get_model_version_metric(registered_model_name, current_version, metric_name)
-                    if current_version is not None
+            mlflow.set_tag("registered_model_name", args.registered_model_name)
+            mlflow.set_tag("registry_registered", str(registry_result.registered).lower())
+            if registry_result.model_version:
+                mlflow.set_tag("model_version", registry_result.model_version)
+
+            if args.promote_if_better and registry_result.registered and registry_result.model_version:
+                production_version = get_current_production_version(
+                    args.registered_model_name,
+                    alias=production_alias,
+                )
+                production_metric = (
+                    get_model_version_metric(args.registered_model_name, production_version, metric_name)
+                    if production_version
                     else None
                 )
-                if should_promote_model(
-                    new_metric=metrics[metric_name],
-                    old_metric=old_metric,
+                if should_promote(
+                    new_metric=validation_metrics[metric_name],
+                    production_metric=production_metric,
                     metric_name=metric_name,
                     min_improvement=min_improvement,
                 ):
-                    set_model_alias(registered_model_name, new_model_version, champion_alias)
-                    promoted_to_champion = True
+                    promote_to_production(
+                        registered_model_name=args.registered_model_name,
+                        new_version=registry_result.model_version,
+                        previous_version=production_version,
+                        alias=production_alias,
+                    )
+                    promoted_to_production = True
+                    promotion_reason = "new_model_better"
+                    mlflow.set_tag("candidate_status", "promoted")
+                else:
+                    promotion_reason = "new_model_not_better"
+                    mlflow.set_tag("candidate_status", "candidate")
+            elif args.promote_if_better and not registry_result.registered:
+                promotion_reason = "registry_unavailable"
+                mlflow.set_tag("candidate_status", "candidate_registry_unavailable")
+            else:
+                mlflow.set_tag("candidate_status", "candidate")
+
+    report = {
+        "run_id": run_id,
+        "experiment_id": experiment_id,
+        "experiment_name": args.experiment_name,
+        "registered_model_name": args.registered_model_name,
+        "features_uri": features_uri,
+        "feature_pipeline_uri": feature_pipeline_uri,
+        "model_uri": registry_result.model_uri if registry_result else None,
+        "model_version": registry_result.model_version if registry_result else None,
+        "registry_registered": registry_result.registered if registry_result else False,
+        "registry_error": registry_result.error if registry_result else None,
+        "estimator_name": estimator_name,
+        "feature_columns": dataset.feature_columns,
+        "metrics": metrics_to_log,
+        "backtest": backtest,
+        "date_ranges": {
+            "train": date_range_payload(split.train_dates),
+            "validation": date_range_payload(split.valid_dates),
+            "test": date_range_payload(split.test_dates),
+        },
+        "promotion": {
+            "promote_if_better": args.promote_if_better,
+            "promoted_to_production": promoted_to_production,
+            "reason": promotion_reason,
+            "production_alias": production_alias,
+            "previous_production_version": production_version,
+            "previous_production_metric": production_metric,
+        },
+    }
+    report_uri = str(Path(DEFAULT_REPORTS_DIR) / f"train_report_{run_id}.json")
+    write_json(report, report_uri)
 
     print(f"run_id: {run_id}")
     print(f"experiment_id: {experiment_id}")
-    print(f"registered_model_name: {registered_model_name}")
-    print(f"new_model_version: {new_model_version}")
-    print(f"promoted_to_champion: {str(promoted_to_champion).lower()}")
+    print(f"registered_model_name: {args.registered_model_name}")
+    print(f"model_version: {report['model_version']}")
+    print(f"registry_registered: {str(report['registry_registered']).lower()}")
+    print(f"promoted_to_production: {str(promoted_to_production).lower()}")
+    print(f"train_report_uri: {report_uri}")
 
 
 if __name__ == "__main__":

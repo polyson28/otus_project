@@ -127,6 +127,48 @@ def download_file(s3_uri: str | os.PathLike[str], local_path: str | os.PathLike[
         _raise_s3_error(error, str(s3_uri))
 
 
+def list_objects(prefix_uri: str | os.PathLike[str]) -> list[dict[str, Any]]:
+    uri_str = str(prefix_uri)
+    bucket, prefix = parse_s3_uri(uri_str.rstrip("/") + "/")
+    client = get_s3_client()
+    objects: list[dict[str, Any]] = []
+    continuation_token: str | None = None
+    try:
+        while True:
+            kwargs: dict[str, Any] = {"Bucket": bucket, "Prefix": prefix}
+            if continuation_token:
+                kwargs["ContinuationToken"] = continuation_token
+            response = client.list_objects_v2(**kwargs)
+            objects.extend(response.get("Contents", []))
+            if not response.get("IsTruncated"):
+                break
+            continuation_token = response.get("NextContinuationToken")
+    except Exception as error:
+        _raise_s3_error(error, uri_str)
+    return objects
+
+
+def latest_object_uri(
+    prefix_uri: str | os.PathLike[str],
+    *,
+    suffixes: tuple[str, ...] | None = None,
+    preferred_filename: str | None = None,
+) -> str:
+    bucket, _ = parse_s3_uri(str(prefix_uri).rstrip("/") + "/")
+    objects = list_objects(prefix_uri)
+    if suffixes:
+        objects = [obj for obj in objects if str(obj.get("Key", "")).endswith(suffixes)]
+    if preferred_filename:
+        preferred = [obj for obj in objects if Path(str(obj.get("Key", ""))).name == preferred_filename]
+        if preferred:
+            objects = preferred
+    objects = [obj for obj in objects if int(obj.get("Size", 0)) > 0]
+    if not objects:
+        raise S3ObjectNotFoundError(f"No objects found under {prefix_uri}")
+    latest = max(objects, key=lambda obj: obj.get("LastModified"))
+    return f"s3://{bucket}/{latest['Key']}"
+
+
 def read_json(uri: str | os.PathLike[str]) -> Any:
     if is_s3_uri(uri):
         return json.loads(_read_s3_bytes(uri).decode("utf-8"))

@@ -12,6 +12,7 @@ decorator==5.2.1
 et_xmlfile==2.0.0
 exceptiongroup==1.2.2
 executing==2.2.0
+fastapi
 FLAML==2.3.4
 dvc
 dvc[s3]
@@ -45,6 +46,7 @@ pexpect==4.9.0
 pillow==11.2.1
 platformdirs==4.3.7
 prompt_toolkit==3.0.51
+prometheus-client
 psutil==7.0.0
 psycopg2-binary
 ptyprocess==0.7.0
@@ -73,6 +75,7 @@ traitlets==5.14.3
 typing_extensions==4.13.2
 tzdata==2025.2
 urllib3==2.4.0
+uvicorn
 wcwidth==0.2.13
 xgboost==2.1.4
 yfinance==0.2.56
