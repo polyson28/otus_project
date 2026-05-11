@@ -1,0 +1,64 @@
+stages:
+  preprocess:
+    cmd: python -m pipelines.preprocess --input-uri Data/final.csv --output-uri artifacts/dvc/interim/data.parquet --config configs/config.yaml
+    deps:
+      - Data/final.csv
+      - pipelines/preprocess.py
+      - src/io/s3.py
+      - configs/config.yaml
+    outs:
+      - artifacts/dvc/interim/data.parquet
+    metrics:
+      - artifacts/dvc/interim/quality_report.json:
+          cache: false
+
+  build_features:
+    cmd: python -m pipelines.build_features --input-uri artifacts/dvc/interim/data.parquet --output-uri artifacts/dvc/features/features.parquet --feature-pipeline-uri artifacts/dvc/features/feature_pipeline.joblib --feature-schema-uri artifacts/dvc/features/feature_schema.json --config configs/config.yaml --mode train
+    deps:
+      - artifacts/dvc/interim/data.parquet
+      - pipelines/build_features.py
+      - src/features/pipeline.py
+      - configs/config.yaml
+    outs:
+      - artifacts/dvc/features/features.parquet
+      - artifacts/dvc/features/feature_pipeline.joblib
+      - artifacts/dvc/features/feature_schema.json
+
+  select_features:
+    cmd: python -m pipelines.select_features --input-uri artifacts/dvc/features/features.parquet --output-uri artifacts/dvc/features/selected_features.parquet --selector-uri artifacts/dvc/features/feature_selector.joblib --selected-features-uri artifacts/dvc/features/selected_features.json --selection-report-uri artifacts/dvc/features/selection_report.json --config configs/config.yaml --mode train
+    deps:
+      - artifacts/dvc/features/features.parquet
+      - artifacts/dvc/features/feature_schema.json
+      - pipelines/select_features.py
+      - src/features/selection.py
+      - configs/config.yaml
+    outs:
+      - artifacts/dvc/features/selected_features.parquet
+      - artifacts/dvc/features/feature_selector.joblib
+      - artifacts/dvc/features/selected_features.json
+    metrics:
+      - artifacts/dvc/features/selection_report.json:
+          cache: false
+
+  train_model:
+    cmd: python pipelines/train.py --features-uri artifacts/dvc/features/selected_features.parquet --feature-pipeline-uri artifacts/dvc/features/feature_pipeline.joblib --config configs/config.yaml --promote-if-better true
+    deps:
+      - artifacts/dvc/features/selected_features.parquet
+      - artifacts/dvc/features/feature_pipeline.joblib
+      - pipelines/train.py
+      - src/models/training.py
+      - src/models/evaluation.py
+      - src/models/mlflow_utils.py
+      - configs/config.yaml
+
+  evaluate_model:
+    cmd: python pipelines/evaluate.py --features-uri artifacts/dvc/features/selected_features.parquet --config configs/config.yaml --output-uri artifacts/dvc/metrics/champion_evaluation.json
+    deps:
+      - artifacts/dvc/features/selected_features.parquet
+      - pipelines/evaluate.py
+      - src/models/evaluation.py
+      - src/models/mlflow_utils.py
+      - configs/config.yaml
+    metrics:
+      - artifacts/dvc/metrics/champion_evaluation.json:
+          cache: false
