@@ -1,0 +1,5 @@
+[core]
+    remote = yc-storage
+['remote "yc-storage"']
+    url = s3://ts-project-bucket/dvc-store
+    endpointurl = https://storage.yandexcloud.net

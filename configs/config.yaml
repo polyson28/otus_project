@@ -16,9 +16,44 @@ s3:
 
 model:
   production_prefix: models/production/
+  metric: mae
   min_improvement: 0.0
   validation_size: 0.2
+  promote_if_better: true
+
+mlflow:
+  tracking_uri: ${MLFLOW_TRACKING_URI}
+  experiment_name: ts-project
+  registered_model_name: ts-project-forecast-model
+  model_alias: champion
+  artifact_root: s3://ts-project-bucket/mlflow-artifacts
+  log_input_examples: true
+  log_model_signature: true
+  challenger_alias: challenger
+  champion_alias: champion
+
+training:
+  model_kind: flaml
+  fallback_model: random_forest
+  time_budget: 600
   metric: mae
+  validation_size: 0.2
+  random_state: 42
+
+evaluation:
+  key_rate: 0.21
+  primary_metric: mae
+  business_metric: profit
+
+promotion:
+  min_mae_improvement: 0.0
+  require_profit_not_worse: true
+
+dvc:
+  enabled: true
+  remote_name: yc-storage
+  remote_url: s3://ts-project-bucket/dvc-store
+  endpoint_url: https://storage.yandexcloud.net
 
 feature_engineering:
   lags:
